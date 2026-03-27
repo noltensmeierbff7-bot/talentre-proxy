@@ -1,12 +1,12 @@
 const express = require('express');
 const cors = require('cors');
+const { WebSocket } = require('ws');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
 const HELIUS_KEY = '5ee0718b-a8f2-423a-87c1-d12bd872b9ee';
 const HELIUS_API = 'https://api.helius.xyz/v0';
-const HELIUS_RPC = 'https://mainnet.helius-rpc.com/?api-key=' + HELIUS_KEY;
 
 app.use(cors());
 app.use(express.json());
@@ -19,284 +19,256 @@ const cache = {
   solPrice: { data: { price: 145 }, updatedAt: 0 }
 };
 
-async function apiFetch(url, opts) {
-  opts = opts || {};
-  const res = await fetch(url, {
-    method: opts.method || 'GET',
-    headers: Object.assign({
-      'Accept': 'application/json',
-      'Content-Type': 'application/json',
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      'Accept': 'application/json, text/plain, */*',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Origin': 'https://pump.fun',
-      'Referer': 'https://pump.fun/'
-    }, opts.headers || {}),
-    body: opts.body || undefined
-  });
-  if (!res.ok) throw new Error('HTTP ' + res.status);
-  return res.json();
-}
-
+// ── HELIUS metadata ──
 async function getTokenMetadata(mints) {
   try {
-    return await apiFetch(HELIUS_API + '/token-metadata?api-key=' + HELIUS_KEY, {
+    const res = await fetch(HELIUS_API + '/token-metadata?api-key=' + HELIUS_KEY, {
       method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ mintAccounts: mints, includeOffChain: true, disableCache: false })
-    }) || [];
-  } catch(e) { return []; }
-}
-
-async function getTokenHolders(mint) {
-  try {
-    const res = await apiFetch(HELIUS_RPC, {
-      method: 'POST',
-      body: JSON.stringify({ jsonrpc:'2.0', id:1, method:'getTokenLargestAccounts', params:[mint] })
     });
-    return res.result && res.result.value ? res.result.value : [];
+    return await res.json() || [];
   } catch(e) { return []; }
 }
 
-async function getTokenTransactions(mint, limit) {
-  limit = limit || 20;
-  try {
-    const data = await apiFetch(
-      HELIUS_API + '/addresses/' + mint + '/transactions?api-key=' + HELIUS_KEY + '&limit=' + limit + '&type=SWAP'
-    );
-    return Array.isArray(data) ? data : [];
-  } catch(e) { return []; }
-}
-
-function normalizePumpFun(c, heliusMeta) {
-  if (!c) return null;
-  var imageUrl = c.image_uri || null;
-  if (heliusMeta && heliusMeta.offChainMetadata && heliusMeta.offChainMetadata.metadata && heliusMeta.offChainMetadata.metadata.image) {
-    imageUrl = heliusMeta.offChainMetadata.metadata.image;
-  }
-  var mc = parseFloat(c.usd_market_cap || 0);
-  var solReserves = parseFloat(c.virtual_sol_reserves || 0) / 1e9;
-  var bondingPct = Math.min(99, Math.max(0, Math.floor((solReserves / 85) * 100)));
-  return {
-    source: 'pumpfun',
-    baseToken: {
-      name:    c.name   || 'Unknown',
-      symbol:  c.symbol || '???',
-      address: c.mint   || ''
-    },
-    priceUsd:    String(mc && c.total_supply ? mc / c.total_supply : 0),
-    priceChange: { h24: parseFloat(c.price_change_24h || 0) },
-    volume:      { h24: parseFloat(c.volume_24h || 0) },
-    liquidity:   { usd: solReserves * 145 },
-    marketCap:   mc,
-    fdv:         mc,
-    pairAddress: c.bonding_curve || c.mint || '',
-    pairCreatedAt: c.created_timestamp ? c.created_timestamp * 1000 : Date.now(),
-    imageUrl:    imageUrl,
-    description: c.description || '',
-    twitter:     c.twitter  || null,
-    telegram:    c.telegram || null,
-    website:     c.website  || null,
-    complete:    c.complete || false,
-    bondingPct:  bondingPct,
-    txns: { h24: { buys: Math.floor((c.volume_24h||0)/400), sells: Math.floor((c.volume_24h||0)/600) } },
-    dexId: 'pumpfun',
-    url: 'https://pump.fun/' + c.mint
-  };
-}
-
-function normalizeTrades(trades) {
-  if (!Array.isArray(trades)) return [];
-  return trades.map(function(t) {
-    return {
-      type:        t.is_buy ? 'buy' : 'sell',
-      solAmount:   parseFloat((t.sol_amount || 0) / 1e9).toFixed(4),
-      tokenAmount: parseFloat(t.token_amount || 0),
-      user:        t.user ? t.user.slice(0,4)+'...'+t.user.slice(-4) : 'Unknown',
-      timestamp:   t.timestamp ? t.timestamp * 1000 : Date.now(),
-      signature:   t.signature || ''
-    };
-  });
-}
-
-// Пробуем разные pump.fun endpoints
-var PUMPFUN_ENDPOINTS = [
-  'https://frontend-api.pump.fun',
-  'https://frontend-api-v2.pump.fun',
-  'https://client-api-2.pump.fun'
-];
-
-async function pumpFetch(path) {
-  for (var i = 0; i < PUMPFUN_ENDPOINTS.length; i++) {
-    try {
-      var data = await apiFetch(PUMPFUN_ENDPOINTS[i] + path);
-      if (data && (Array.isArray(data) ? data.length > 0 : true)) {
-        return data;
-      }
-    } catch(e) {
-      console.log('endpoint ' + PUMPFUN_ENDPOINTS[i] + ' failed: ' + e.message);
-    }
-  }
-  throw new Error('All pump.fun endpoints failed');
-}
-
-// Fallback через DexScreener если pump.fun заблокирован
-async function fetchDexScreenerSolana() {
-  var res = await apiFetch('https://api.dexscreener.com/token-boosts/top/v1');
-  var boosts = Array.isArray(res) ? res : [];
-  var solBoosts = boosts.filter(function(b){ return b.chainId === 'solana'; }).slice(0, 20);
-  if (!solBoosts.length) throw new Error('no sol boosts');
-  var addresses = solBoosts.map(function(b){ return b.tokenAddress; }).filter(Boolean).join(',');
-  var pairData = await apiFetch('https://api.dexscreener.com/latest/dex/tokens/' + addresses);
-  return (pairData.pairs || []).filter(function(p){ return p.chainId === 'solana' && parseFloat(p.priceUsd) > 0; });
-}
-
-function normalizeDexScreener(p, type) {
-  return {
-    source: 'dexscreener',
-    baseToken: { name: p.baseToken.name, symbol: p.baseToken.symbol, address: p.baseToken.address },
-    priceUsd: p.priceUsd || '0',
-    priceChange: { h24: parseFloat((p.priceChange && p.priceChange.h24) || 0) },
-    volume: { h24: parseFloat((p.volume && p.volume.h24) || 0) },
-    liquidity: { usd: parseFloat((p.liquidity && p.liquidity.usd) || 0) },
-    marketCap: parseFloat(p.marketCap || p.fdv || 0),
-    fdv: parseFloat(p.fdv || 0),
-    pairAddress: p.pairAddress || '',
-    pairCreatedAt: p.pairCreatedAt || Date.now(),
-    imageUrl: p.info && p.info.imageUrl ? p.info.imageUrl : null,
-    complete: type === 'migrated',
-    bondingPct: type === 'migrated' ? 100 : type === 'soon' ? 80 : 30,
-    txns: p.txns || { h24: { buys: 0, sells: 0 } },
-    dexId: p.dexId || 'raydium',
-    url: p.url || ''
-  };
-}
-
-async function refreshNew() {
-  try {
-    var data = await pumpFetch('/coins?offset=0&limit=50&sort=created_timestamp&order=DESC&includeNsfw=false');
-    var coins = Array.isArray(data) ? data : [];
-    console.log('pump.fun new: ' + coins.length + ' coins');
-    var mints = coins.slice(0,20).map(function(c){ return c.mint; }).filter(Boolean);
-    var meta = mints.length ? await getTokenMetadata(mints) : [];
-    var metaMap = {};
-    meta.forEach(function(m){ if(m.mint) metaMap[m.mint] = m; });
-    cache.new.data = coins.map(function(c){ return normalizePumpFun(c, metaMap[c.mint]); }).filter(Boolean);
-    cache.new.updatedAt = Date.now();
-    console.log('[NEW] ' + cache.new.data.length + ' tokens');
-  } catch(e) {
-    console.error('pump.fun blocked, trying dexscreener:', e.message);
-    try {
-      var pairs = await fetchDexScreenerSolana();
-      cache.new.data = pairs.slice(0, 20).map(function(p){ return normalizeDexScreener(p, 'new'); });
-      cache.new.updatedAt = Date.now();
-      console.log('[NEW fallback dex] ' + cache.new.data.length + ' tokens');
-    } catch(e2) { console.error('dexscreener also failed:', e2.message); }
-  }
-}
-
-async function refreshTrending() {
-  try {
-    var data = await pumpFetch('/coins?offset=0&limit=50&sort=market_cap&order=DESC&includeNsfw=false');
-    var coins = Array.isArray(data) ? data : [];
-    console.log('pump.fun trending: ' + coins.length + ' coins');
-    var mints = coins.slice(0,20).map(function(c){ return c.mint; }).filter(Boolean);
-    var meta = mints.length ? await getTokenMetadata(mints) : [];
-    var metaMap = {};
-    meta.forEach(function(m){ if(m.mint) metaMap[m.mint] = m; });
-    var normalized = coins.map(function(c){ return normalizePumpFun(c, metaMap[c.mint]); }).filter(Boolean);
-    cache.trending.data = normalized.filter(function(t){ return !t.complete; });
-    cache.migrated.data = normalized.filter(function(t){ return t.complete; });
-    cache.trending.updatedAt = Date.now();
-    cache.migrated.updatedAt = Date.now();
-    console.log('[TRENDING] ' + cache.trending.data.length + ' [MIGRATED] ' + cache.migrated.data.length);
-  } catch(e) {
-    console.error('pump.fun trending blocked, trying dexscreener:', e.message);
-    try {
-      var pairs = await fetchDexScreenerSolana();
-      cache.trending.data = pairs.slice(0, 20).map(function(p){ return normalizeDexScreener(p, 'soon'); });
-      cache.migrated.data = pairs.slice(20, 35).map(function(p){ return normalizeDexScreener(p, 'migrated'); });
-      cache.trending.updatedAt = Date.now();
-      cache.migrated.updatedAt = Date.now();
-      console.log('[TRENDING fallback dex] ' + cache.trending.data.length);
-    } catch(e2) { console.error('dexscreener also failed:', e2.message); }
-  }
-}
-
+// ── SOL price ──
 async function refreshSolPrice() {
   try {
-    var data = await apiFetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
-    cache.solPrice.data = { price: (data.solana && data.solana.usd) ? data.solana.usd : 145 };
-    cache.solPrice.updatedAt = Date.now();
+    const res = await fetch('https://price.jup.ag/v6/price?ids=SOL');
+    const data = await res.json();
+    if (data.data && data.data.SOL) {
+      cache.solPrice.data = { price: data.data.SOL.price };
+      cache.solPrice.updatedAt = Date.now();
+    }
   } catch(e) {
     try {
-      var jup = await apiFetch('https://price.jup.ag/v6/price?ids=SOL');
-      cache.solPrice.data = { price: (jup.data && jup.data.SOL) ? jup.data.SOL.price : 145 };
+      const res = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
+      const data = await res.json();
+      if (data.solana) cache.solPrice.data = { price: data.solana.usd };
     } catch(e2) {}
   }
 }
 
-// ENDPOINTS
-app.get('/api/pumpfun/new',      function(req, res){ res.json(cache.new.data); });
-app.get('/api/pumpfun/trending', function(req, res){ res.json(cache.trending.data); });
-app.get('/api/pumpfun/migrated', function(req, res){ res.json(cache.migrated.data); });
-app.get('/api/sol/price',        function(req, res){ res.json(cache.solPrice.data); });
+// ── PUMP.FUN WebSocket ──
+// Подключаемся к pump.fun через WebSocket — это не блокируется
+let wsConnected = false;
+const recentTokens = new Map(); // mint -> token data
 
-app.get('/api/pumpfun/trades/:mint', async function(req, res) {
+function connectPumpFunWS() {
+  console.log('Connecting to pump.fun WebSocket...');
+  
+  const ws = new WebSocket('wss://frontend-api.pump.fun/socket.io/?EIO=4&transport=websocket', {
+    headers: {
+      'Origin': 'https://pump.fun',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    }
+  });
+
+  ws.on('open', function() {
+    wsConnected = true;
+    console.log('pump.fun WS connected!');
+    // Subscribe to new tokens
+    ws.send('40');
+    setTimeout(() => {
+      ws.send('42["subscribeNewToken"]');
+    }, 500);
+  });
+
+  ws.on('message', function(raw) {
+    try {
+      const msg = raw.toString();
+      // Parse socket.io messages
+      if (msg.startsWith('42')) {
+        const json = JSON.parse(msg.slice(2));
+        const event = json[0];
+        const data  = json[1];
+
+        if (event === 'newToken' && data) {
+          const token = normalizeWSToken(data);
+          if (token) {
+            recentTokens.set(data.mint, { token, ts: Date.now() });
+            updateCacheFromWS();
+          }
+        }
+        if (event === 'tradeCreated' && data && data.mint) {
+          // Update existing token with trade data
+          if (recentTokens.has(data.mint)) {
+            const entry = recentTokens.get(data.mint);
+            entry.token.volume = { h24: (entry.token.volume?.h24 || 0) + (data.sol_amount / 1e9) * cache.solPrice.data.price };
+            if (data.usd_market_cap) entry.token.marketCap = data.usd_market_cap;
+            updateCacheFromWS();
+          }
+        }
+      }
+      // Keep-alive
+      if (msg === '2') ws.send('3');
+    } catch(e) {}
+  });
+
+  ws.on('close', function() {
+    wsConnected = false;
+    console.log('pump.fun WS disconnected, reconnecting in 3s...');
+    setTimeout(connectPumpFunWS, 3000);
+  });
+
+  ws.on('error', function(e) {
+    console.error('pump.fun WS error:', e.message);
+  });
+}
+
+function normalizeWSToken(d) {
+  if (!d || !d.mint) return null;
+  return {
+    source: 'pumpfun',
+    baseToken: {
+      name:    d.name   || 'Unknown',
+      symbol:  d.symbol || '???',
+      address: d.mint   || ''
+    },
+    priceUsd:    String(d.usd_market_cap && d.total_supply ? d.usd_market_cap / d.total_supply : 0),
+    priceChange: { h24: 0 },
+    volume:      { h24: 0 },
+    liquidity:   { usd: 0 },
+    marketCap:   parseFloat(d.usd_market_cap || 0),
+    fdv:         parseFloat(d.usd_market_cap || 0),
+    pairAddress: d.bonding_curve || d.mint || '',
+    pairCreatedAt: Date.now(),
+    imageUrl:    d.image_uri || null,
+    description: d.description || '',
+    twitter:     d.twitter  || null,
+    telegram:    d.telegram || null,
+    website:     d.website  || null,
+    complete:    false,
+    bondingPct:  0,
+    txns:        { h24: { buys: 0, sells: 0 } },
+    dexId:       'pumpfun',
+    url:         'https://pump.fun/' + d.mint
+  };
+}
+
+function updateCacheFromWS() {
+  const now = Date.now();
+  // Keep only last 10 minutes of tokens
+  for (const [mint, entry] of recentTokens.entries()) {
+    if (now - entry.ts > 10 * 60 * 1000) recentTokens.delete(mint);
+  }
+  const tokens = Array.from(recentTokens.values())
+    .sort((a, b) => b.ts - a.ts)
+    .map(e => e.token);
+  
+  cache.new.data      = tokens.slice(0, 30);
+  cache.new.updatedAt = now;
+}
+
+// ── Fallback: DexScreener (если WS не работает) ──
+async function fetchFromDexScreener() {
   try {
-    var limit = parseInt(req.query.limit) || 30;
-    var txs = await getTokenTransactions(req.params.mint, limit);
-    if (txs.length > 0) {
-      return res.json(txs.map(function(tx) {
-        var swap = (tx.events && tx.events.swap) ? tx.events.swap : {};
-        var isBuy = swap.nativeInput != null;
-        var solAmt = isBuy ? (swap.nativeInput.amount || 0) / 1e9 : (swap.nativeOutput ? swap.nativeOutput.amount || 0 : 0) / 1e9;
+    const res = await fetch('https://api.dexscreener.com/token-boosts/top/v1');
+    const boosts = await res.json();
+    const solBoosts = (Array.isArray(boosts) ? boosts : [])
+      .filter(b => b.chainId === 'solana').slice(0, 20);
+    
+    if (!solBoosts.length) throw new Error('no boosts');
+    
+    const addresses = solBoosts.map(b => b.tokenAddress).filter(Boolean).join(',');
+    const pRes = await fetch('https://api.dexscreener.com/latest/dex/tokens/' + addresses);
+    const pData = await pRes.json();
+    const pairs = (pData.pairs || [])
+      .filter(p => p.chainId === 'solana' && parseFloat(p.priceUsd) > 0)
+      .sort((a,b) => (parseFloat(b.volume?.h24)||0) - (parseFloat(a.volume?.h24)||0));
+
+    if (pairs.length > 0) {
+      cache.new.data      = pairs.slice(0, 15).map(p => normDex(p, false));
+      cache.trending.data = pairs.slice(0, 20).map(p => normDex(p, false));
+      cache.migrated.data = pairs.slice(20, 35).map(p => normDex(p, true));
+      const now = Date.now();
+      cache.new.updatedAt = cache.trending.updatedAt = cache.migrated.updatedAt = now;
+      console.log('DexScreener fallback: ' + pairs.length + ' pairs loaded');
+    }
+  } catch(e) {
+    console.error('DexScreener fallback failed:', e.message);
+  }
+}
+
+function normDex(p, migrated) {
+  return {
+    source: 'dexscreener',
+    baseToken: {
+      name:    p.baseToken?.name   || 'Unknown',
+      symbol:  p.baseToken?.symbol || '???',
+      address: p.baseToken?.address || ''
+    },
+    priceUsd:    p.priceUsd || '0',
+    priceChange: { h24: parseFloat(p.priceChange?.h24 || 0) },
+    volume:      { h24: parseFloat(p.volume?.h24 || 0) },
+    liquidity:   { usd: parseFloat(p.liquidity?.usd || 0) },
+    marketCap:   parseFloat(p.marketCap || p.fdv || 0),
+    fdv:         parseFloat(p.fdv || 0),
+    pairAddress: p.pairAddress || '',
+    pairCreatedAt: p.pairCreatedAt || Date.now(),
+    imageUrl:    p.info?.imageUrl || null,
+    complete:    migrated,
+    bondingPct:  migrated ? 100 : 50,
+    txns:        p.txns || { h24: { buys: 0, sells: 0 } },
+    dexId:       p.dexId || 'raydium',
+    url:         p.url || ''
+  };
+}
+
+// ── ENDPOINTS ──
+app.get('/api/pumpfun/new',      (req, res) => res.json(cache.new.data));
+app.get('/api/pumpfun/trending', (req, res) => res.json(cache.trending.data));
+app.get('/api/pumpfun/migrated', (req, res) => res.json(cache.migrated.data));
+app.get('/api/sol/price',        (req, res) => res.json(cache.solPrice.data));
+
+app.get('/api/pumpfun/trades/:mint', async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 30;
+    const r = await fetch(
+      HELIUS_API + '/addresses/' + req.params.mint + '/transactions?api-key=' + HELIUS_KEY + '&limit=' + limit + '&type=SWAP'
+    );
+    const txs = await r.json();
+    if (Array.isArray(txs) && txs.length > 0) {
+      return res.json(txs.map(tx => {
+        const swap = tx.events?.swap || {};
+        const isBuy = swap.nativeInput != null;
+        const sol = isBuy ? (swap.nativeInput?.amount||0)/1e9 : (swap.nativeOutput?.amount||0)/1e9;
         return {
           type: isBuy ? 'buy' : 'sell',
-          solAmount: parseFloat(solAmt.toFixed(4)),
-          user: tx.feePayer ? tx.feePayer.slice(0,4)+'...'+tx.feePayer.slice(-4) : 'Unknown',
-          timestamp: tx.timestamp ? tx.timestamp * 1000 : Date.now()
+          solAmount: sol.toFixed(4),
+          user: tx.feePayer ? tx.feePayer.slice(0,4)+'...'+tx.feePayer.slice(-4) : '???',
+          timestamp: tx.timestamp ? tx.timestamp*1000 : Date.now()
         };
       }));
     }
-    var data = await apiFetch('https://frontend-api.pump.fun/trades/latest/' + req.params.mint + '?limit=' + limit);
-    res.json(normalizeTrades(data));
+    res.json([]);
   } catch(e) { res.status(502).json({ error: e.message }); }
 });
 
-app.get('/api/pumpfun/token/:mint', async function(req, res) {
-  try {
-    var coin = await apiFetch('https://frontend-api.pump.fun/coins/' + req.params.mint);
-    var meta = await getTokenMetadata([req.params.mint]);
-    res.json(normalizePumpFun(coin, meta[0] || null));
-  } catch(e) { res.status(502).json({ error: e.message }); }
-});
+app.get('/health', (req, res) => res.json({
+  status: 'ok',
+  wsConnected,
+  cache: {
+    new:      cache.new.data.length + ' tokens',
+    trending: cache.trending.data.length + ' tokens',
+    migrated: cache.migrated.data.length + ' tokens',
+  }
+}));
 
-app.get('/api/helius/holders/:mint', async function(req, res) {
-  try { res.json(await getTokenHolders(req.params.mint)); }
-  catch(e) { res.status(502).json({ error: e.message }); }
-});
-
-app.get('/health', function(req, res) {
-  res.json({
-    status: 'ok',
-    cache: {
-      new:      cache.new.data.length + ' tokens',
-      trending: cache.trending.data.length + ' tokens',
-      migrated: cache.migrated.data.length + ' tokens'
-    }
-  });
-});
-
-// СТАРТ
-app.listen(PORT, async function() {
-  console.log('TALENTRE Proxy -> http://localhost:' + PORT);
-  console.log('Helius: ' + HELIUS_KEY.slice(0,8) + '...');
-
-  await Promise.all([refreshNew(), refreshTrending(), refreshSolPrice()]);
-
-  setInterval(refreshNew,      3000);
-  setInterval(refreshTrending, 5000);
+// ── СТАРТ ──
+app.listen(PORT, async () => {
+  console.log('TALENTRE Proxy -> port ' + PORT);
+  
+  // Сначала загружаем из DexScreener (мгновенно)
+  await fetchFromDexScreener();
+  
+  // Потом подключаем pump.fun WebSocket для новых токенов
+  connectPumpFunWS();
+  
+  // Обновляем DexScreener каждые 5 секунд как основной источник
+  setInterval(fetchFromDexScreener, 5000);
   setInterval(refreshSolPrice, 30000);
-
-  console.log('Cache running: NEW=3s TRENDING/MIGRATED=5s SOL=30s');
+  refreshSolPrice();
+  
+  console.log('Ready!');
 });
