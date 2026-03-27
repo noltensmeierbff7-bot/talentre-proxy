@@ -1,11 +1,10 @@
 {
   "name": "talentre-proxy",
   "version": "1.0.0",
-  "description": "API proxy for TALENTRE Terminal - pump.fun & dexscreener",
+  "description": "TALENTRE Terminal API proxy",
   "main": "proxy-server.js",
   "scripts": {
-    "start": "node proxy-server.js",
-    "dev": "node --watch proxy-server.js"
+    "start": "node proxy-server.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
