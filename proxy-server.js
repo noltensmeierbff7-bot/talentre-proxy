@@ -26,7 +26,11 @@ async function apiFetch(url, opts) {
     headers: Object.assign({
       'Accept': 'application/json',
       'Content-Type': 'application/json',
-      'User-Agent': 'Mozilla/5.0'
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Accept': 'application/json, text/plain, */*',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Origin': 'https://pump.fun',
+      'Referer': 'https://pump.fun/'
     }, opts.headers || {}),
     body: opts.body || undefined
   });
@@ -114,24 +118,87 @@ function normalizeTrades(trades) {
   });
 }
 
+// Пробуем разные pump.fun endpoints
+var PUMPFUN_ENDPOINTS = [
+  'https://frontend-api.pump.fun',
+  'https://frontend-api-v2.pump.fun',
+  'https://client-api-2.pump.fun'
+];
+
+async function pumpFetch(path) {
+  for (var i = 0; i < PUMPFUN_ENDPOINTS.length; i++) {
+    try {
+      var data = await apiFetch(PUMPFUN_ENDPOINTS[i] + path);
+      if (data && (Array.isArray(data) ? data.length > 0 : true)) {
+        return data;
+      }
+    } catch(e) {
+      console.log('endpoint ' + PUMPFUN_ENDPOINTS[i] + ' failed: ' + e.message);
+    }
+  }
+  throw new Error('All pump.fun endpoints failed');
+}
+
+// Fallback через DexScreener если pump.fun заблокирован
+async function fetchDexScreenerSolana() {
+  var res = await apiFetch('https://api.dexscreener.com/token-boosts/top/v1');
+  var boosts = Array.isArray(res) ? res : [];
+  var solBoosts = boosts.filter(function(b){ return b.chainId === 'solana'; }).slice(0, 20);
+  if (!solBoosts.length) throw new Error('no sol boosts');
+  var addresses = solBoosts.map(function(b){ return b.tokenAddress; }).filter(Boolean).join(',');
+  var pairData = await apiFetch('https://api.dexscreener.com/latest/dex/tokens/' + addresses);
+  return (pairData.pairs || []).filter(function(p){ return p.chainId === 'solana' && parseFloat(p.priceUsd) > 0; });
+}
+
+function normalizeDexScreener(p, type) {
+  return {
+    source: 'dexscreener',
+    baseToken: { name: p.baseToken.name, symbol: p.baseToken.symbol, address: p.baseToken.address },
+    priceUsd: p.priceUsd || '0',
+    priceChange: { h24: parseFloat((p.priceChange && p.priceChange.h24) || 0) },
+    volume: { h24: parseFloat((p.volume && p.volume.h24) || 0) },
+    liquidity: { usd: parseFloat((p.liquidity && p.liquidity.usd) || 0) },
+    marketCap: parseFloat(p.marketCap || p.fdv || 0),
+    fdv: parseFloat(p.fdv || 0),
+    pairAddress: p.pairAddress || '',
+    pairCreatedAt: p.pairCreatedAt || Date.now(),
+    imageUrl: p.info && p.info.imageUrl ? p.info.imageUrl : null,
+    complete: type === 'migrated',
+    bondingPct: type === 'migrated' ? 100 : type === 'soon' ? 80 : 30,
+    txns: p.txns || { h24: { buys: 0, sells: 0 } },
+    dexId: p.dexId || 'raydium',
+    url: p.url || ''
+  };
+}
+
 async function refreshNew() {
   try {
-    var data = await apiFetch('https://frontend-api.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=DESC&includeNsfw=false');
+    var data = await pumpFetch('/coins?offset=0&limit=50&sort=created_timestamp&order=DESC&includeNsfw=false');
     var coins = Array.isArray(data) ? data : [];
+    console.log('pump.fun new: ' + coins.length + ' coins');
     var mints = coins.slice(0,20).map(function(c){ return c.mint; }).filter(Boolean);
     var meta = mints.length ? await getTokenMetadata(mints) : [];
     var metaMap = {};
     meta.forEach(function(m){ if(m.mint) metaMap[m.mint] = m; });
     cache.new.data = coins.map(function(c){ return normalizePumpFun(c, metaMap[c.mint]); }).filter(Boolean);
     cache.new.updatedAt = Date.now();
-    console.log('[' + new Date().toLocaleTimeString() + '] NEW: ' + cache.new.data.length + ' tokens');
-  } catch(e) { console.error('refresh new:', e.message); }
+    console.log('[NEW] ' + cache.new.data.length + ' tokens');
+  } catch(e) {
+    console.error('pump.fun blocked, trying dexscreener:', e.message);
+    try {
+      var pairs = await fetchDexScreenerSolana();
+      cache.new.data = pairs.slice(0, 20).map(function(p){ return normalizeDexScreener(p, 'new'); });
+      cache.new.updatedAt = Date.now();
+      console.log('[NEW fallback dex] ' + cache.new.data.length + ' tokens');
+    } catch(e2) { console.error('dexscreener also failed:', e2.message); }
+  }
 }
 
 async function refreshTrending() {
   try {
-    var data = await apiFetch('https://frontend-api.pump.fun/coins?offset=0&limit=50&sort=market_cap&order=DESC&includeNsfw=false');
+    var data = await pumpFetch('/coins?offset=0&limit=50&sort=market_cap&order=DESC&includeNsfw=false');
     var coins = Array.isArray(data) ? data : [];
+    console.log('pump.fun trending: ' + coins.length + ' coins');
     var mints = coins.slice(0,20).map(function(c){ return c.mint; }).filter(Boolean);
     var meta = mints.length ? await getTokenMetadata(mints) : [];
     var metaMap = {};
@@ -141,8 +208,18 @@ async function refreshTrending() {
     cache.migrated.data = normalized.filter(function(t){ return t.complete; });
     cache.trending.updatedAt = Date.now();
     cache.migrated.updatedAt = Date.now();
-    console.log('[' + new Date().toLocaleTimeString() + '] TRENDING: ' + cache.trending.data.length + ' MIGRATED: ' + cache.migrated.data.length);
-  } catch(e) { console.error('refresh trending:', e.message); }
+    console.log('[TRENDING] ' + cache.trending.data.length + ' [MIGRATED] ' + cache.migrated.data.length);
+  } catch(e) {
+    console.error('pump.fun trending blocked, trying dexscreener:', e.message);
+    try {
+      var pairs = await fetchDexScreenerSolana();
+      cache.trending.data = pairs.slice(0, 20).map(function(p){ return normalizeDexScreener(p, 'soon'); });
+      cache.migrated.data = pairs.slice(20, 35).map(function(p){ return normalizeDexScreener(p, 'migrated'); });
+      cache.trending.updatedAt = Date.now();
+      cache.migrated.updatedAt = Date.now();
+      console.log('[TRENDING fallback dex] ' + cache.trending.data.length);
+    } catch(e2) { console.error('dexscreener also failed:', e2.message); }
+  }
 }
 
 async function refreshSolPrice() {
